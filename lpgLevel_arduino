@@ -1,1 +1,207 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// WiFi credentials
+const char* ssid = "IT Made easy.";
+const char* wifi_password = "Nigiheki?";
+
+// Server details
+const char* serverName = "http://192.168.55.157:5000/insert_data";
+
+// Pin definitions
+const int trigPin = D5;
+const int echoPin = D6;
+const int mq2AnalogPin = A0;
+const int mq2DigitalPin = D7;
+const int buzzerPin = D3;
+
+// Constants
+float tankHeight = 30.0;    // Tank height in cm
+float fullTankMass = 6.0;   // Full LPG mass in kg
+float emptyTankMass = 0.0;  // Empty LPG tank mass in kg
+float gasDetectionThreshold = 5000; // Threshold for MQ-2 gas detection
+float minimumConsumptionRate = 0.5; // Minimum valid consumption rate (kg/hour)
+
+// Variables
+long duration;
+int distance;
+float gasMass;
+float lpgRemaining = 0.0;
+float lpgUsed = 0.0;
+int gasDetected = 0;
+
+// Variables for consumption rate calculation
+float previousGasMass = fullTankMass - emptyTankMass;
+unsigned long previousTime = 0;
+float consumptionRate = 0.0;
+float hoursRemaining = 0.0;
+
+void ensureWiFiConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Reconnecting to Wi-Fi...");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+      WiFi.begin(ssid, wifi_password);
+    }
+    Serial.println("Connected!");
+  }
+}
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+
+  Serial.begin(9600);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(mq2AnalogPin, INPUT);
+  pinMode(mq2DigitalPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Welcome back to: ");
+  lcd.setCursor(0, 1);
+  lcd.print("LPG Detection");
+  delay(1000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Developer Name: ");
+  lcd.setCursor(0, 1);
+  lcd.print("IRAHARI Soso");
+  delay(9000);
+  lcd.clear();
+  Serial.println("LPG Monitoring System Initialized");
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, wifi_password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+
+  previousTime = millis();
+}
+
+void loop() {
+  // Ultrasonic Sensor: Measure distance to LPG surface
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH);
+  distance = duration * 0.034 / 2;
+
+  // Validate distance measurement
+  if (distance < 0) distance = 0;
+  if (distance > tankHeight) distance = tankHeight;
+
+  // Calculate LPG level based on the measured distance
+  float gasLevel = tankHeight - distance;
+  if (gasLevel < 0) gasLevel = 0;
+  if (gasLevel > tankHeight) gasLevel = tankHeight;
+
+  // Calculate gas mass using the proportion of gas level to tank height
+  gasMass = (gasLevel / tankHeight) * fullTankMass - emptyTankMass;
+
+  // Ensure valid gas mass values
+  if (gasMass < 0) gasMass = 0;
+  if (gasMass > fullTankMass) gasMass = fullTankMass;
+
+  // Calculate LPG used and remaining
+  lpgUsed = previousGasMass - gasMass;
+  if (lpgUsed < 0) lpgUsed = 0;
+
+  lpgRemaining = gasMass - emptyTankMass;
+
+  // Read MQ-2 sensor value
+  int mq2Value = analogRead(mq2AnalogPin);
+  gasDetected = (mq2Value > gasDetectionThreshold) ? 1 : 0;
+
+  // Determine decision based on gas detection
+  String decision = (gasDetected == 1) ? "High Gas" : "Normal";
+
+  // Calculate consumption rate (kg per hour)
+  unsigned long currentTime = millis();
+  float timeElapsed = (currentTime - previousTime) / 3600000.0;
+
+  if (timeElapsed > 0 && previousGasMass > gasMass) {
+    consumptionRate = (previousGasMass - gasMass) / timeElapsed;
+    if (consumptionRate < minimumConsumptionRate) {
+      consumptionRate = minimumConsumptionRate;
+    }
+  } else {
+    consumptionRate = minimumConsumptionRate;
+  }
+
+  // Calculate remaining hours
+  if (consumptionRate > 0) {
+    hoursRemaining = lpgRemaining / consumptionRate;
+  } else {
+    hoursRemaining = -1; // Invalid or zero consumption rate
+  }
+
+  // Ensure hours remaining is within a valid range
+  if (hoursRemaining < 0 || hoursRemaining > 10000) {
+    hoursRemaining = -1;
+  }
+
+  previousGasMass = gasMass;
+  previousTime = currentTime;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LPG Rem: ");
+  lcd.print(lpgRemaining, 1);
+  lcd.print("kg");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Refill: ");
+  if (hoursRemaining > 0) {
+    lcd.print(hoursRemaining, 0);
+    lcd.print(" hrs");
+  } else {
+    lcd.print("N/A");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    WiFiClient client;
+
+    ensureWiFiConnected();
+
+    http.begin(client, serverName);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String httpRequestData = "distance=" + String(distance) +
+                             "&gas_mass=" + String(gasMass) +
+                             "&lpg_used=" + String(lpgUsed) +
+                             "&lpg_remaining=" + String(lpgRemaining) +
+                             "&gas_detected=" + String(gasDetected) +
+                             "&decision=" + decision +
+                             "&hours_remaining=" + String(hoursRemaining);
+
+    int httpResponseCode = http.POST(httpRequestData);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Response: " + response);
+    } else {
+      Serial.print("Error in HTTP request, code: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("Error: WiFi not connected");
+  }
+
+  delay(2000);
+}
 
